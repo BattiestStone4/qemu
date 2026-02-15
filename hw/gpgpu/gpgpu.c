@@ -809,20 +809,6 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
     pci_config_set_interrupt_pin(pci_conf, 1);
 
     /*
-     * 初始化 MSI-X 中断
-     * 参数: 设备, 向量数, BAR 索引, BAR 内偏移, BAR 索引, PBA 偏移, cap 偏移
-     *
-     * MSI-X 表和 PBA (Pending Bit Array) 放在 BAR 0 的高地址区域
-     * 这样不会与控制寄存器冲突
-     */
-    if (msix_init_exclusive_bar(pdev, GPGPU_MSIX_VECTORS, 0, errp)) {
-        return;
-    }
-
-    /* 初始化 MSI (作为 MSI-X 的后备) */
-    msi_init(pdev, 0, 1, true, false, errp);
-
-    /*
      * 分配显存
      * 使用 g_malloc0 分配并清零
      */
@@ -861,6 +847,23 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
                      &s->doorbell_mmio);
 
     /*
+     * 初始化 MSI-X 中断
+     * MSI-X 表放在 BAR 0 的高地址区域 (0xFE000)
+     * PBA 放在 0xFF000
+     * 这样不会与控制寄存器 (0x0000-0x3000) 冲突
+     */
+    if (msix_init(pdev, GPGPU_MSIX_VECTORS,
+                  &s->ctrl_mmio, 0, 0xFE000,  /* MSI-X 表: BAR0, 偏移 0xFE000 */
+                  &s->ctrl_mmio, 0, 0xFF000,  /* PBA: BAR0, 偏移 0xFF000 */
+                  0, errp)) {
+        g_free(s->vram_ptr);
+        return;
+    }
+
+    /* 初始化 MSI (作为 MSI-X 的后备) */
+    msi_init(pdev, 0, 1, true, false, errp);
+
+    /*
      * 初始化定时器
      * 用于模拟异步操作 (DMA 和内核执行)
      */
@@ -891,7 +894,7 @@ static void gpgpu_exit(PCIDevice *pdev)
     g_free(s->vram_ptr);
 
     /* 清理中断 */
-    msix_uninit_exclusive_bar(pdev);
+    msix_uninit(pdev, &s->ctrl_mmio, &s->ctrl_mmio);
     msi_uninit(pdev);
 }
 
