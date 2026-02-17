@@ -453,19 +453,47 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
         break;
 
     /*
-     * 线程上下文寄存器
-     * 在功能模拟模式下，这些返回 0
-     * TODO: 在精确模拟模式下，需要返回当前执行线程的 ID
+     * 线程上下文寄存器 (CTRL 设备)
+     * GPU 线程通过读取这些寄存器获取自己的 ID
+     * 这些值由主机驱动在调度线程前设置
      */
     case GPGPU_REG_THREAD_ID_X:
+        val = s->simt.thread_id[0];
+        break;
+
     case GPGPU_REG_THREAD_ID_Y:
+        val = s->simt.thread_id[1];
+        break;
+
     case GPGPU_REG_THREAD_ID_Z:
+        val = s->simt.thread_id[2];
+        break;
+
     case GPGPU_REG_BLOCK_ID_X:
+        val = s->simt.block_id[0];
+        break;
+
     case GPGPU_REG_BLOCK_ID_Y:
+        val = s->simt.block_id[1];
+        break;
+
     case GPGPU_REG_BLOCK_ID_Z:
+        val = s->simt.block_id[2];
+        break;
+
     case GPGPU_REG_WARP_ID:
+        val = s->simt.warp_id;
+        break;
+
     case GPGPU_REG_LANE_ID:
-        val = 0;
+        val = s->simt.lane_id;
+        break;
+
+    /*
+     * 同步寄存器 (只读部分)
+     */
+    case GPGPU_REG_THREAD_MASK:
+        val = s->simt.thread_mask;
         break;
 
     default:
@@ -517,6 +545,7 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
             s->irq_status = 0;
             memset(&s->kernel, 0, sizeof(s->kernel));
             memset(&s->dma, 0, sizeof(s->dma));
+            memset(&s->simt, 0, sizeof(s->simt));
 
             /* 取消所有挂起的定时器 */
             timer_del(s->dma_timer);
@@ -664,13 +693,82 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
         break;
 
     /*
+     * 线程上下文寄存器 (写操作)
+     * 主机驱动在分发线程前设置这些值
+     */
+    case GPGPU_REG_THREAD_ID_X:
+        s->simt.thread_id[0] = val;
+        break;
+
+    case GPGPU_REG_THREAD_ID_Y:
+        s->simt.thread_id[1] = val;
+        break;
+
+    case GPGPU_REG_THREAD_ID_Z:
+        s->simt.thread_id[2] = val;
+        break;
+
+    case GPGPU_REG_BLOCK_ID_X:
+        s->simt.block_id[0] = val;
+        break;
+
+    case GPGPU_REG_BLOCK_ID_Y:
+        s->simt.block_id[1] = val;
+        break;
+
+    case GPGPU_REG_BLOCK_ID_Z:
+        s->simt.block_id[2] = val;
+        break;
+
+    case GPGPU_REG_WARP_ID:
+        s->simt.warp_id = val;
+        break;
+
+    case GPGPU_REG_LANE_ID:
+        s->simt.lane_id = val;
+        break;
+
+    case GPGPU_REG_THREAD_MASK:
+        s->simt.thread_mask = val;
+        break;
+
+    /*
      * 同步寄存器
      */
     case GPGPU_REG_BARRIER:
         /*
-         * 在功能模拟模式下，屏障是空操作
-         * TODO: 在精确模拟模式下实现线程同步
+         * Barrier 同步实现:
+         * 1. 每个线程到达 barrier 时写入此寄存器
+         * 2. barrier_count 递增
+         * 3. 当 barrier_count == barrier_target 时，所有线程都到达
+         * 4. 此时重置 barrier，允许线程继续执行
+         *
+         * 在功能模拟模式下，这是一个简化实现
+         * 真实的 SIMT 需要更复杂的 warp 级同步
          */
+        if (!s->simt.barrier_active) {
+            /* 首次写入激活 barrier */
+            s->simt.barrier_active = true;
+            s->simt.barrier_count = 1;
+            /*
+             * barrier_target 设置为当前 block 的线程数
+             * 这需要在 dispatch 时设置
+             */
+            if (s->simt.barrier_target == 0) {
+                s->simt.barrier_target = s->kernel.block_dim[0] *
+                                         s->kernel.block_dim[1] *
+                                         s->kernel.block_dim[2];
+            }
+        } else {
+            s->simt.barrier_count++;
+        }
+
+        /* 检查是否所有线程都到达 */
+        if (s->simt.barrier_count >= s->simt.barrier_target) {
+            /* 重置 barrier */
+            s->simt.barrier_active = false;
+            s->simt.barrier_count = 0;
+        }
         break;
 
     default:
@@ -917,6 +1015,9 @@ static void gpgpu_reset(DeviceState *dev)
 
     memset(&s->kernel, 0, sizeof(s->kernel));
     memset(&s->dma, 0, sizeof(s->dma));
+
+    /* 复位 SIMT 上下文 */
+    memset(&s->simt, 0, sizeof(s->simt));
 
     /* 取消挂起的定时器 */
     timer_del(s->dma_timer);

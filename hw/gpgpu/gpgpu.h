@@ -205,6 +205,35 @@ typedef struct GPGPUDMAState {
 
 /*
  * ============================================================================
+ * SIMT 执行上下文 (CTRL 设备核心)
+ * ============================================================================
+ * 用于跟踪当前执行线程的上下文信息
+ * GPU 核心通过 MMIO 读取这些信息来获取自己的 thread_id 等
+ *
+ * 使用方式:
+ * 1. Host 驱动在 dispatch 前设置 grid/block 维度
+ * 2. 模拟执行时，设置当前的 thread_id/block_id
+ * 3. GPU 线程通过读取 0x1000-0x1FFF 获取自己的 ID
+ * 4. 写入 0x2000 触发 barrier 同步
+ */
+typedef struct GPGPUSIMTContext {
+    /* 当前执行的线程位置 */
+    uint32_t thread_id[3];      /* threadIdx.x/y/z */
+    uint32_t block_id[3];       /* blockIdx.x/y/z */
+    uint32_t warp_id;           /* 当前 warp ID */
+    uint32_t lane_id;           /* 线程在 warp 中的位置 (0-31) */
+
+    /* Barrier 同步状态 */
+    uint32_t barrier_count;     /* 到达 barrier 的线程数 */
+    uint32_t barrier_target;    /* 需要到达的线程总数 */
+    bool barrier_active;        /* barrier 是否激活 */
+
+    /* 活跃线程掩码 (用于分支分歧) */
+    uint32_t thread_mask;       /* 32 位掩码，每位代表一个线程 */
+} GPGPUSIMTContext;
+
+/*
+ * ============================================================================
  * 设备主状态结构
  * ============================================================================
  * 这是设备的核心数据结构，包含所有设备状态
@@ -246,6 +275,9 @@ struct GPGPUState {
 
     /*-- 内核执行状态 (用于模拟) --*/
     QEMUTimer *kernel_timer;        /* 内核执行完成定时器 */
+
+    /*-- SIMT 执行上下文 (CTRL 设备) --*/
+    GPGPUSIMTContext simt;          /* 当前线程的执行上下文 */
 };
 
 #endif /* HW_GPGPU_H */

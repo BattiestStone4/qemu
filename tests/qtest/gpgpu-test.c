@@ -56,6 +56,20 @@
 #define GPGPU_REG_DMA_CTRL          0x0414
 #define GPGPU_REG_DMA_STATUS        0x0418
 
+/* SIMT 上下文寄存器 (CTRL 设备) */
+#define GPGPU_REG_THREAD_ID_X       0x1000
+#define GPGPU_REG_THREAD_ID_Y       0x1004
+#define GPGPU_REG_THREAD_ID_Z       0x1008
+#define GPGPU_REG_BLOCK_ID_X        0x1010
+#define GPGPU_REG_BLOCK_ID_Y        0x1014
+#define GPGPU_REG_BLOCK_ID_Z        0x1018
+#define GPGPU_REG_WARP_ID           0x1020
+#define GPGPU_REG_LANE_ID           0x1024
+
+/* 同步寄存器 */
+#define GPGPU_REG_BARRIER           0x2000
+#define GPGPU_REG_THREAD_MASK       0x2004
+
 /* 寄存器位定义 */
 #define GPGPU_CTRL_ENABLE           (1 << 0)
 #define GPGPU_CTRL_RESET            (1 << 1)
@@ -314,6 +328,171 @@ static void gpgpu_test_irq_regs(void *obj, void *data, QGuestAllocator *alloc)
     qpci_iounmap(pdev, bar0);
 }
 
+/*
+ * 测试 8: SIMT 线程 ID 寄存器测试 (CTRL 设备)
+ * 验证 thread_id 寄存器可正确读写
+ */
+static void gpgpu_test_thread_id_regs(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QGPGPU *gpgpu = obj;
+    QPCIDevice *pdev = &gpgpu->dev;
+    QPCIBar bar0;
+    uint32_t val;
+
+    qpci_device_enable(pdev);
+    bar0 = qpci_iomap(pdev, 0, NULL);
+
+    /* 初始值应为 0 */
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_THREAD_ID_X);
+    g_assert_cmpuint(val, ==, 0);
+
+    /* 写入 thread_id.x */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_THREAD_ID_X, 15);
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_THREAD_ID_X);
+    g_assert_cmpuint(val, ==, 15);
+
+    /* 写入 thread_id.y */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_THREAD_ID_Y, 7);
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_THREAD_ID_Y);
+    g_assert_cmpuint(val, ==, 7);
+
+    /* 写入 thread_id.z */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_THREAD_ID_Z, 3);
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_THREAD_ID_Z);
+    g_assert_cmpuint(val, ==, 3);
+
+    qpci_iounmap(pdev, bar0);
+}
+
+/*
+ * 测试 9: SIMT Block ID 寄存器测试 (CTRL 设备)
+ * 验证 block_id 寄存器可正确读写
+ */
+static void gpgpu_test_block_id_regs(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QGPGPU *gpgpu = obj;
+    QPCIDevice *pdev = &gpgpu->dev;
+    QPCIBar bar0;
+    uint32_t val;
+
+    qpci_device_enable(pdev);
+    bar0 = qpci_iomap(pdev, 0, NULL);
+
+    /* 写入 block_id.x */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_ID_X, 63);
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_BLOCK_ID_X);
+    g_assert_cmpuint(val, ==, 63);
+
+    /* 写入 block_id.y */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_ID_Y, 31);
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_BLOCK_ID_Y);
+    g_assert_cmpuint(val, ==, 31);
+
+    /* 写入 block_id.z */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_ID_Z, 1);
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_BLOCK_ID_Z);
+    g_assert_cmpuint(val, ==, 1);
+
+    qpci_iounmap(pdev, bar0);
+}
+
+/*
+ * 测试 10: SIMT Warp/Lane ID 寄存器测试 (CTRL 设备)
+ * 验证 warp_id 和 lane_id 寄存器可正确读写
+ */
+static void gpgpu_test_warp_lane_regs(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QGPGPU *gpgpu = obj;
+    QPCIDevice *pdev = &gpgpu->dev;
+    QPCIBar bar0;
+    uint32_t val;
+
+    qpci_device_enable(pdev);
+    bar0 = qpci_iomap(pdev, 0, NULL);
+
+    /* 写入 warp_id */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_WARP_ID, 3);
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_WARP_ID);
+    g_assert_cmpuint(val, ==, 3);
+
+    /* 写入 lane_id (0-31 范围) */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_LANE_ID, 17);
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_LANE_ID);
+    g_assert_cmpuint(val, ==, 17);
+
+    qpci_iounmap(pdev, bar0);
+}
+
+/*
+ * 测试 11: SIMT 线程掩码寄存器测试 (CTRL 设备)
+ * 验证 thread_mask 寄存器可正确读写
+ */
+static void gpgpu_test_thread_mask_reg(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QGPGPU *gpgpu = obj;
+    QPCIDevice *pdev = &gpgpu->dev;
+    QPCIBar bar0;
+    uint32_t val;
+
+    qpci_device_enable(pdev);
+    bar0 = qpci_iomap(pdev, 0, NULL);
+
+    /* 初始掩码应为 0 */
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_THREAD_MASK);
+    g_assert_cmphex(val, ==, 0x0);
+
+    /* 写入掩码: 所有 32 个线程活跃 */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_THREAD_MASK, 0xFFFFFFFF);
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_THREAD_MASK);
+    g_assert_cmphex(val, ==, 0xFFFFFFFF);
+
+    /* 写入掩码: 只有前 16 个线程活跃 */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_THREAD_MASK, 0x0000FFFF);
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_THREAD_MASK);
+    g_assert_cmphex(val, ==, 0x0000FFFF);
+
+    qpci_iounmap(pdev, bar0);
+}
+
+/*
+ * 测试 12: SIMT 上下文复位测试 (CTRL 设备)
+ * 验证软复位会清除 SIMT 上下文
+ */
+static void gpgpu_test_simt_reset(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QGPGPU *gpgpu = obj;
+    QPCIDevice *pdev = &gpgpu->dev;
+    QPCIBar bar0;
+    uint32_t val;
+
+    qpci_device_enable(pdev);
+    bar0 = qpci_iomap(pdev, 0, NULL);
+
+    /* 设置一些 SIMT 上下文 */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_THREAD_ID_X, 123);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_ID_X, 456);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_WARP_ID, 7);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_THREAD_MASK, 0xDEADBEEF);
+
+    /* 触发软复位 */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_RESET);
+
+    /* 验证 SIMT 上下文被清除 */
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_THREAD_ID_X);
+    g_assert_cmpuint(val, ==, 0);
+
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_BLOCK_ID_X);
+    g_assert_cmpuint(val, ==, 0);
+
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_WARP_ID);
+    g_assert_cmpuint(val, ==, 0);
+
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_THREAD_MASK);
+    g_assert_cmphex(val, ==, 0x0);
+
+    qpci_iounmap(pdev, bar0);
+}
+
 static void gpgpu_register_nodes(void)
 {
     QOSGraphEdgeOptions opts = {
@@ -339,6 +518,13 @@ static void gpgpu_register_nodes(void)
     qos_add_test("vram-access", "gpgpu", gpgpu_test_vram_access, NULL);
     qos_add_test("dma-regs", "gpgpu", gpgpu_test_dma_regs, NULL);
     qos_add_test("irq-regs", "gpgpu", gpgpu_test_irq_regs, NULL);
+
+    /* CTRL 设备测试 (SIMT 上下文) */
+    qos_add_test("simt-thread-id", "gpgpu", gpgpu_test_thread_id_regs, NULL);
+    qos_add_test("simt-block-id", "gpgpu", gpgpu_test_block_id_regs, NULL);
+    qos_add_test("simt-warp-lane", "gpgpu", gpgpu_test_warp_lane_regs, NULL);
+    qos_add_test("simt-thread-mask", "gpgpu", gpgpu_test_thread_mask_reg, NULL);
+    qos_add_test("simt-reset", "gpgpu", gpgpu_test_simt_reset, NULL);
 }
 
 libqos_init(gpgpu_register_nodes);
