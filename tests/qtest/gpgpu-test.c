@@ -70,6 +70,11 @@
 #define GPGPU_REG_BARRIER           0x2000
 #define GPGPU_REG_THREAD_MASK       0x2004
 
+/* 内核地址寄存器 */
+#define GPGPU_REG_KERNEL_ADDR_LO    0x0300
+#define GPGPU_REG_KERNEL_ADDR_HI    0x0304
+#define GPGPU_REG_DISPATCH          0x0330
+
 /* 寄存器位定义 */
 #define GPGPU_CTRL_ENABLE           (1 << 0)
 #define GPGPU_CTRL_RESET            (1 << 1)
@@ -493,6 +498,95 @@ static void gpgpu_test_simt_reset(void *obj, void *data, QGuestAllocator *alloc)
     qpci_iounmap(pdev, bar0);
 }
 
+/*
+ * 测试 13: 简单内核执行测试
+ * 验证 RISC-V 指令解释器能正确执行简单的 kernel
+ *
+ * Kernel 功能: C[thread_id] = thread_id
+ * 每个线程将自己的 thread_id 写入输出数组
+ */
+
+/*
+ * 简单的 RISC-V 内核代码 (RV32I)
+ *
+ * 地址布局:
+ *   0x0000: kernel 代码
+ *   0x1000: 输出数组 C
+ *
+ * CTRL 设备地址:
+ *   0x80000000: thread_id.x
+ *
+ * 伪代码:
+ *   t0 = 0x80000000       // CTRL 基地址
+ *   t1 = load(t0)         // thread_id
+ *   t2 = t1 << 2          // byte offset
+ *   t3 = 0x1000           // 输出地址基址
+ *   t3 = t3 + t2          // &C[thread_id]
+ *   store(t3, t1)         // C[thread_id] = thread_id
+ *   ebreak                // 停止
+ */
+static const uint32_t simple_kernel[] = {
+    0x800002B7,  /* lui   x5, 0x80000      ; t0 = 0x80000000 (CTRL base) */
+    0x0002A303,  /* lw    x6, 0(x5)        ; t1 = thread_id */
+    0x00231393,  /* slli  x7, x6, 2        ; t2 = thread_id * 4 */
+    0x00001E37,  /* lui   x28, 1           ; t3 = 0x1000 */
+    0x007E0E33,  /* add   x28, x28, x7     ; t3 = &C[thread_id] */
+    0x006E2023,  /* sw    x6, 0(x28)       ; C[thread_id] = thread_id */
+    0x00100073,  /* ebreak                 ; stop */
+};
+
+static void gpgpu_test_kernel_exec(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QGPGPU *gpgpu = obj;
+    QPCIDevice *pdev = &gpgpu->dev;
+    QPCIBar bar0, bar2;
+    uint32_t val;
+    uint32_t num_threads = 8;  /* 测试 8 个线程 */
+
+    qpci_device_enable(pdev);
+    bar0 = qpci_iomap(pdev, 0, NULL);
+    bar2 = qpci_iomap(pdev, 2, NULL);
+
+    /* 1. 使能设备 */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
+
+    /* 2. 上传内核代码到 VRAM (地址 0x0000) */
+    for (size_t i = 0; i < sizeof(simple_kernel) / sizeof(simple_kernel[0]); i++) {
+        qpci_io_writel(pdev, bar2, i * 4, simple_kernel[i]);
+    }
+
+    /* 3. 清零输出区域 (地址 0x1000) */
+    for (uint32_t i = 0; i < num_threads; i++) {
+        qpci_io_writel(pdev, bar2, 0x1000 + i * 4, 0xDEADBEEF);
+    }
+
+    /* 4. 配置内核参数 */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ADDR_LO, 0x0000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ADDR_HI, 0x0000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_X, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Y, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Z, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_X, num_threads);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Y, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Z, 1);
+
+    /* 5. 触发内核执行 */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DISPATCH, 1);
+
+    /* 6. 检查执行完成 (设备不再忙) */
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_GLOBAL_STATUS);
+    g_assert_cmpuint(val & GPGPU_STATUS_READY, ==, GPGPU_STATUS_READY);
+
+    /* 7. 验证输出结果: C[i] 应该等于 i */
+    for (uint32_t i = 0; i < num_threads; i++) {
+        val = qpci_io_readl(pdev, bar2, 0x1000 + i * 4); 
+        g_assert_cmpuint(val, ==, i);
+    }
+
+    qpci_iounmap(pdev, bar0);
+    qpci_iounmap(pdev, bar2);
+}
+
 static void gpgpu_register_nodes(void)
 {
     QOSGraphEdgeOptions opts = {
@@ -525,6 +619,9 @@ static void gpgpu_register_nodes(void)
     qos_add_test("simt-warp-lane", "gpgpu", gpgpu_test_warp_lane_regs, NULL);
     qos_add_test("simt-thread-mask", "gpgpu", gpgpu_test_thread_mask_reg, NULL);
     qos_add_test("simt-reset", "gpgpu", gpgpu_test_simt_reset, NULL);
+
+    /* 内核执行测试 */
+    qos_add_test("kernel-exec", "gpgpu", gpgpu_test_kernel_exec, NULL);
 }
 
 libqos_init(gpgpu_register_nodes);

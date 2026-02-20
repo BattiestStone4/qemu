@@ -23,6 +23,7 @@
 #include "migration/vmstate.h"
 
 #include "gpgpu.h"
+#include "gpgpu_core.h"
 
 /*
  * ============================================================================
@@ -276,21 +277,25 @@ static void gpgpu_dispatch_kernel(GPGPUState *s)
     s->global_status |= GPGPU_STATUS_BUSY;
 
     /*
-     * 计算模拟的执行时间
-     * 简单模型: 时间与总线程数成正比
-     * TODO: 可以实现更精确的时序模型
+     * 执行内核
+     * 使用 RISC-V 指令解释器直接执行
      */
-    uint64_t total_threads = (uint64_t)s->kernel.grid_dim[0] *
-                             s->kernel.grid_dim[1] *
-                             s->kernel.grid_dim[2] *
-                             s->kernel.block_dim[0] *
-                             s->kernel.block_dim[1] *
-                             s->kernel.block_dim[2];
+    int ret = gpgpu_core_exec_kernel(s);
 
-    /* 每 1000 个线程增加 1ms 延迟，最少 1ms */
-    uint64_t delay_ms = (total_threads / 1000) + 1;
+    /* 更新状态 */
+    s->global_status &= ~GPGPU_STATUS_BUSY;
 
-    timer_mod(s->kernel_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + delay_ms);
+    if (ret < 0) {
+        /* 执行错误 */
+        s->error_status |= GPGPU_ERR_KERNEL_FAULT;
+        s->global_status |= GPGPU_STATUS_ERROR;
+        gpgpu_raise_irq(s, GPGPU_IRQ_ERROR);
+    } else {
+        /* 执行成功，触发完成中断 */
+        if (s->irq_enable & GPGPU_IRQ_KERNEL_DONE) {
+            gpgpu_raise_irq(s, GPGPU_IRQ_KERNEL_DONE);
+        }
+    }
 }
 
 /*
