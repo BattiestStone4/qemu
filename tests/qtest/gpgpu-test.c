@@ -513,12 +513,12 @@ static void gpgpu_test_simt_reset(void *obj, void *data, QGuestAllocator *alloc)
  *   0x0000: kernel 代码
  *   0x1000: 输出数组 C
  *
- * CTRL 设备地址:
- *   0x80000000: thread_id.x
+ * 通过 mhartid CSR 获取线程 ID:
+ *   mhartid 位域: [block(19)|warp(8)|tid(5)]
  *
  * 伪代码:
- *   t0 = 0x80000000       // CTRL 基地址
- *   t1 = load(t0)         // thread_id
+ *   t1 = csrr(mhartid)    // 读取 mhartid
+ *   t1 = t1 & 0x1F        // 提取 thread_id (lane within warp)
  *   t2 = t1 << 2          // byte offset
  *   t3 = 0x1000           // 输出地址基址
  *   t3 = t3 + t2          // &C[thread_id]
@@ -526,8 +526,8 @@ static void gpgpu_test_simt_reset(void *obj, void *data, QGuestAllocator *alloc)
  *   ebreak                // 停止
  */
 static const uint32_t simple_kernel[] = {
-    0x800002B7,  /* lui   x5, 0x80000      ; t0 = 0x80000000 (CTRL base) */
-    0x0002A303,  /* lw    x6, 0(x5)        ; t1 = thread_id */
+    0xF1402373,  /* csrrs x6, mhartid, x0  ; t1 = mhartid */
+    0x01F37313,  /* andi  x6, x6, 0x1F     ; t1 = thread_id (lane) */
     0x00231393,  /* slli  x7, x6, 2        ; t2 = thread_id * 4 */
     0x00001E37,  /* lui   x28, 1           ; t3 = 0x1000 */
     0x007E0E33,  /* add   x28, x28, x7     ; t3 = &C[thread_id] */

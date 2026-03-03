@@ -63,6 +63,14 @@
 #define FUNCT3_SH       0x1
 #define FUNCT3_SW       0x2
 
+/* funct3 for SYSTEM (CSR instructions) */
+#define FUNCT3_CSRRW    0x1
+#define FUNCT3_CSRRS    0x2
+#define FUNCT3_CSRRC    0x3
+#define FUNCT3_CSRRWI   0x5
+#define FUNCT3_CSRRSI   0x6
+#define FUNCT3_CSRRCI   0x7
+
 /*
  * ============================================================================
  * 指令解码辅助宏
@@ -77,6 +85,7 @@
 #define GET_RS1(inst)       BITS(inst, 19, 15)
 #define GET_RS2(inst)       BITS(inst, 24, 20)
 #define GET_FUNCT7(inst)    BITS(inst, 31, 25)
+#define GET_CSR(inst)       BITS(inst, 31, 20)
 
 /* I-type 立即数 */
 #define GET_IMM_I(inst)     SEXT(BITS(inst, 31, 20), 12)
@@ -107,7 +116,7 @@
 
 /* 当前执行上下文（用于内存访问时获取 lane 信息） */
 static __thread GPGPUWarp *current_warp;
-static __thread int current_lane_id;
+static __thread GPGPULane *current_lane;
 
 /**
  * core_mem_read - GPU 核心内存读取
@@ -124,7 +133,7 @@ static uint32_t core_mem_read(GPGPUState *s, uint32_t addr, int size)
         addr < GPGPU_CORE_CTRL_BASE + 0x100) {
         switch (addr) {
         case GPGPU_CORE_CTRL_THREAD_ID_X:
-            return current_lane_id;  /* 简化：只支持 1D */
+            return MHARTID_THREAD(current_lane->mhartid);
         case GPGPU_CORE_CTRL_THREAD_ID_Y:
             return 0;
         case GPGPU_CORE_CTRL_THREAD_ID_Z:
@@ -403,7 +412,27 @@ static int exec_one_inst(GPGPUState *s, GPGPULane *lane, uint32_t inst)
         if (inst == 0x00100073) {
             return 1;
         }
-        /* 其他 system 指令忽略 */
+        /* CSR 指令 */
+        if (funct3 >= FUNCT3_CSRRW && funct3 <= FUNCT3_CSRRCI) {
+            uint32_t csr = GET_CSR(inst);
+            uint32_t csr_val = 0;
+
+            switch (csr) {
+            case CSR_MHARTID:
+                csr_val = lane->mhartid;
+                break;
+            default:
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "GPGPU core: unknown CSR 0x%x\n", csr);
+                break;
+            }
+
+            /* 写入 rd（rd != x0 时） */
+            if (rd != 0) {
+                lane->gpr[rd] = csr_val;
+            }
+            /* 只读 CSR，忽略写操作 */
+        }
         break;
 
     default:
@@ -430,11 +459,13 @@ static int exec_one_inst(GPGPUState *s, GPGPULane *lane, uint32_t inst)
 
 void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
                           uint32_t thread_id_base, const uint32_t block_id[3],
-                          uint32_t num_threads)
+                          uint32_t num_threads,
+                          uint32_t warp_id, uint32_t block_id_linear)
 {
     memset(warp, 0, sizeof(*warp));
 
     warp->thread_id_base = thread_id_base;
+    warp->warp_id = warp_id;
     warp->block_id[0] = block_id[0];
     warp->block_id[1] = block_id[1];
     warp->block_id[2] = block_id[2];
@@ -444,6 +475,8 @@ void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
         if (i < num_threads) {
             warp->lanes[i].pc = pc;
             warp->lanes[i].active = true;
+            warp->lanes[i].mhartid =
+                MHARTID_ENCODE(block_id_linear, warp_id, i);
             warp->active_mask |= (1U << i);
         } else {
             warp->lanes[i].active = false;
@@ -470,8 +503,8 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                 continue;
             }
 
-            current_lane_id = warp->thread_id_base + i;
             GPGPULane *lane = &warp->lanes[i];
+            current_lane = lane;
 
             int ret = exec_one_inst(s, lane, inst);
             if (ret < 0) {
@@ -519,6 +552,8 @@ int gpgpu_core_exec_kernel(GPGPUState *s)
         for (uint32_t by = 0; by < grid_y; by++) {
             for (uint32_t bx = 0; bx < grid_x; bx++) {
                 uint32_t block_id[3] = {bx, by, bz};
+                uint32_t block_id_linear =
+                    bx + by * grid_x + bz * grid_x * grid_y;
 
                 /* 每个 block 分成多个 warp 执行 */
                 for (uint32_t tid = 0; tid < threads_per_block;
@@ -529,8 +564,10 @@ int gpgpu_core_exec_kernel(GPGPUState *s)
                         num_threads = GPGPU_WARP_SIZE;
                     }
 
+                    uint32_t warp_id = tid / GPGPU_WARP_SIZE;
                     gpgpu_core_init_warp(&warp, kernel_addr, tid, block_id,
-                                         num_threads);
+                                         num_threads, warp_id,
+                                         block_id_linear);
 
                     int ret = gpgpu_core_exec_warp(s, &warp, 100000);
                     if (ret < 0) {

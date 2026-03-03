@@ -28,6 +28,31 @@ typedef struct GPGPUState GPGPUState;
 
 /*
  * ============================================================================
+ * mhartid CSR 定义
+ * ============================================================================
+ * 位域布局:
+ *   31        13 12     5 4    0
+ *   +---------+--------+------+
+ *   | block   | warp   | tid  |
+ *   | (19bit) | (8bit) | (5b) |
+ *   +---------+--------+------+
+ */
+#define CSR_MHARTID             0xF14
+
+#define MHARTID_THREAD_BITS     5
+#define MHARTID_WARP_BITS       8
+#define MHARTID_BLOCK_BITS      19
+#define MHARTID_THREAD_MASK     0x1F
+#define MHARTID_WARP_MASK       0xFF
+
+#define MHARTID_ENCODE(block, warp, thread) \
+    (((block) << 13) | ((warp) << 5) | ((thread) & 0x1F))
+#define MHARTID_THREAD(id)      ((id) & 0x1F)
+#define MHARTID_WARP(id)        (((id) >> 5) & 0xFF)
+#define MHARTID_BLOCK(id)       ((id) >> 13)
+
+/*
+ * ============================================================================
  * Lane 状态结构
  * ============================================================================
  * 每个 Lane 相当于一个简化的 RISC-V 核心
@@ -35,6 +60,7 @@ typedef struct GPGPUState GPGPUState;
 typedef struct GPGPULane {
     uint32_t gpr[GPGPU_NUM_REGS];   /* 通用寄存器 x0-x31 */
     uint32_t pc;                     /* 程序计数器 */
+    uint32_t mhartid;                /* 完整 hart ID (block|warp|lane) */
     bool active;                     /* 是否活跃 */
 } GPGPULane;
 
@@ -48,6 +74,7 @@ typedef struct GPGPUWarp {
     GPGPULane lanes[GPGPU_WARP_SIZE];   /* 32 个 lane */
     uint32_t active_mask;                /* 活跃掩码，每位代表一个 lane */
     uint32_t thread_id_base;             /* 这个 warp 的起始 thread_id */
+    uint32_t warp_id;                    /* warp 在 block 内的编号 */
     uint32_t block_id[3];                /* 所属 block 的 ID */
 } GPGPUWarp;
 
@@ -84,10 +111,13 @@ typedef struct GPGPUWarp {
  * @thread_id_base: 起始线程 ID
  * @block_id: block ID 数组 [x, y, z]
  * @num_threads: 活跃线程数量 (最多 32)
+ * @warp_id: warp 在 block 内的编号
+ * @block_id_linear: 线性化的 block ID
  */
 void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
                           uint32_t thread_id_base, const uint32_t block_id[3],
-                          uint32_t num_threads);
+                          uint32_t num_threads,
+                          uint32_t warp_id, uint32_t block_id_linear);
 
 /**
  * gpgpu_core_exec_warp - 执行一个 warp 直到完成
