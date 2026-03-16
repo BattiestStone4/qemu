@@ -33,6 +33,15 @@
 #define OPCODE_OP       0x33    /* 0110011 */
 #define OPCODE_SYSTEM   0x73    /* 1110011 */
 
+/* RV32F Opcodes */
+#define OPCODE_LOAD_FP  0x07    /* 0000111 */
+#define OPCODE_STORE_FP 0x27    /* 0100111 */
+#define OPCODE_FMADD    0x43    /* 1000011 */
+#define OPCODE_FMSUB    0x47    /* 1000111 */
+#define OPCODE_FNMSUB   0x4B    /* 1001011 */
+#define OPCODE_FNMADD   0x4F    /* 1001111 */
+#define OPCODE_OP_FP    0x53    /* 1010011 */
+
 /* funct3 for OP and OP_IMM */
 #define FUNCT3_ADD_SUB  0x0
 #define FUNCT3_SLL      0x1
@@ -62,6 +71,20 @@
 #define FUNCT3_SB       0x0
 #define FUNCT3_SH       0x1
 #define FUNCT3_SW       0x2
+
+/* OP_FP funct7 constants */
+#define FUNCT7_FADD_S     0x00
+#define FUNCT7_FSUB_S     0x04
+#define FUNCT7_FMUL_S     0x08
+#define FUNCT7_FDIV_S     0x0C
+#define FUNCT7_FSQRT_S    0x2C
+#define FUNCT7_FSGNJ_S    0x10
+#define FUNCT7_FMINMAX_S  0x14
+#define FUNCT7_FCVT_W_S   0x60
+#define FUNCT7_FCVT_S_W   0x68
+#define FUNCT7_FMV_X_W    0x70
+#define FUNCT7_FCMP_S     0x50
+#define FUNCT7_FMV_W_X    0x78
 
 /* funct3 for SYSTEM (CSR instructions) */
 #define FUNCT3_CSRRW    0x1
@@ -107,6 +130,10 @@
                                  (BITS(inst, 19, 12) << 12) | \
                                  (BITS(inst, 20, 20) << 11) | \
                                  (BITS(inst, 30, 21) << 1), 21)
+
+/* R4-type (fused multiply-add) */
+#define GET_RS3(inst)       BITS(inst, 31, 27)
+#define GET_FUNCT2(inst)    BITS(inst, 26, 25)
 
 /*
  * ============================================================================
@@ -195,6 +222,94 @@ static void core_mem_write(GPGPUState *s, uint32_t addr, uint32_t val, int size)
     }
 
     memcpy(s->vram_ptr + addr, &val, size);
+}
+
+/*
+ * ============================================================================
+ * RV32F 辅助函数
+ * ============================================================================
+ */
+
+/**
+ * decode_rm - 解码舍入模式
+ * rm 字段 (funct3): 0=RNE, 1=RTZ, 2=RDN, 3=RUP, 4=RMM, 7=dynamic(fcsr.frm)
+ */
+static FloatRoundMode decode_rm(uint32_t rm, uint32_t fcsr)
+{
+    if (rm == 7) {
+        rm = (fcsr >> 5) & 0x7;
+    }
+    switch (rm) {
+    case 0: return float_round_nearest_even;
+    case 1: return float_round_to_zero;
+    case 2: return float_round_down;
+    case 3: return float_round_up;
+    case 4: return float_round_nearest_even; /* RMM: approx as RNE */
+    default: return float_round_nearest_even;
+    }
+}
+
+/**
+ * prep_fp_status - 设置舍入模式并清除异常标志
+ */
+static void prep_fp_status(float_status *fps, FloatRoundMode rm)
+{
+    set_float_rounding_mode(rm, fps);
+    set_float_exception_flags(0, fps);
+}
+
+/**
+ * sync_fp_exceptions - 将 softfloat 异常标志累积到 fcsr.fflags
+ * RISC-V fflags: bit0=NX, bit1=UF, bit2=OF, bit3=DZ, bit4=NV
+ */
+static void sync_fp_exceptions(GPGPULane *lane)
+{
+    int sf_flags = get_float_exception_flags(&lane->fp_status);
+    uint32_t rv_flags = 0;
+
+    if (sf_flags & float_flag_inexact) {
+        rv_flags |= (1 << 0);  /* NX */
+    }
+    if (sf_flags & float_flag_underflow) {
+        rv_flags |= (1 << 1);  /* UF */
+    }
+    if (sf_flags & float_flag_overflow) {
+        rv_flags |= (1 << 2);  /* OF */
+    }
+    if (sf_flags & float_flag_divbyzero) {
+        rv_flags |= (1 << 3);  /* DZ */
+    }
+    if (sf_flags & float_flag_invalid) {
+        rv_flags |= (1 << 4);  /* NV */
+    }
+    lane->fcsr |= rv_flags;  /* OR 累积 */
+}
+
+/**
+ * fclass_s - RISC-V fclass.s 分类逻辑
+ * 返回 10 位掩码中设置一位
+ */
+static uint32_t fclass_s(float32 val, float_status *fps)
+{
+    bool is_neg = float32_is_neg(val);
+    bool is_inf = float32_is_infinity(val);
+    bool is_zero = float32_is_zero(val);
+    bool is_snan = float32_is_signaling_nan(val, fps);
+    bool is_qnan = float32_is_quiet_nan(val, fps);
+    bool is_denorm = float32_is_zero_or_denormal(val) && !is_zero;
+    bool is_normal = float32_is_normal(val);
+
+    if (is_neg && is_inf)    return 1 << 0;   /* -inf */
+    if (is_neg && is_normal) return 1 << 1;   /* -normal */
+    if (is_neg && is_denorm) return 1 << 2;   /* -subnormal */
+    if (is_neg && is_zero)   return 1 << 3;   /* -0 */
+    if (!is_neg && is_zero)  return 1 << 4;   /* +0 */
+    if (!is_neg && is_denorm) return 1 << 5;  /* +subnormal */
+    if (!is_neg && is_normal) return 1 << 6;  /* +normal */
+    if (!is_neg && is_inf)   return 1 << 7;   /* +inf */
+    if (is_snan)             return 1 << 8;   /* signaling NaN */
+    if (is_qnan)             return 1 << 9;   /* quiet NaN */
+    return 1 << 9; /* fallback: qNaN */
 }
 
 /*
@@ -407,6 +522,171 @@ static int exec_one_inst(GPGPUState *s, GPGPULane *lane, uint32_t inst)
         break;
     }
 
+    /* ================================================================
+     * RV32F 浮点指令
+     * ================================================================ */
+
+    case OPCODE_LOAD_FP: {
+        /* flw: fpr[rd] = mem[gpr[rs1] + imm_i] */
+        int32_t imm = GET_IMM_I(inst);
+        uint32_t addr = src1 + imm;
+        lane->fpr[rd] = core_mem_read(s, addr, 4);
+        break;
+    }
+
+    case OPCODE_STORE_FP: {
+        /* fsw: mem[gpr[rs1] + imm_s] = fpr[rs2] */
+        int32_t imm = GET_IMM_S(inst);
+        uint32_t addr = src1 + imm;
+        core_mem_write(s, addr, lane->fpr[rs2], 4);
+        break;
+    }
+
+    case OPCODE_FMADD:
+    case OPCODE_FMSUB:
+    case OPCODE_FNMSUB:
+    case OPCODE_FNMADD: {
+        uint32_t rs3 = GET_RS3(inst);
+        FloatRoundMode rm = decode_rm(funct3, lane->fcsr);
+        prep_fp_status(&lane->fp_status, rm);
+
+        int muladd_flags = 0;
+        switch (opcode) {
+        case OPCODE_FMSUB:
+            muladd_flags = float_muladd_negate_c;
+            break;
+        case OPCODE_FNMSUB:
+            muladd_flags = float_muladd_negate_product;
+            break;
+        case OPCODE_FNMADD:
+            muladd_flags = float_muladd_negate_c | float_muladd_negate_product;
+            break;
+        }
+
+        lane->fpr[rd] = float32_muladd(lane->fpr[rs1], lane->fpr[rs2],
+                                        lane->fpr[rs3], muladd_flags,
+                                        &lane->fp_status);
+        sync_fp_exceptions(lane);
+        break;
+    }
+
+    case OPCODE_OP_FP: {
+        FloatRoundMode rm = decode_rm(funct3, lane->fcsr);
+        prep_fp_status(&lane->fp_status, rm);
+
+        switch (funct7) {
+        case FUNCT7_FADD_S:
+            lane->fpr[rd] = float32_add(lane->fpr[rs1], lane->fpr[rs2],
+                                         &lane->fp_status);
+            break;
+        case FUNCT7_FSUB_S:
+            lane->fpr[rd] = float32_sub(lane->fpr[rs1], lane->fpr[rs2],
+                                         &lane->fp_status);
+            break;
+        case FUNCT7_FMUL_S:
+            lane->fpr[rd] = float32_mul(lane->fpr[rs1], lane->fpr[rs2],
+                                         &lane->fp_status);
+            break;
+        case FUNCT7_FDIV_S:
+            lane->fpr[rd] = float32_div(lane->fpr[rs1], lane->fpr[rs2],
+                                         &lane->fp_status);
+            break;
+        case FUNCT7_FSQRT_S:
+            lane->fpr[rd] = float32_sqrt(lane->fpr[rs1], &lane->fp_status);
+            break;
+        case FUNCT7_FSGNJ_S: {
+            uint32_t a = lane->fpr[rs1];
+            uint32_t b = lane->fpr[rs2];
+            switch (funct3) {
+            case 0: /* fsgnj.s */
+                lane->fpr[rd] = (a & 0x7FFFFFFF) | (b & 0x80000000);
+                break;
+            case 1: /* fsgnjn.s */
+                lane->fpr[rd] = (a & 0x7FFFFFFF) | (~b & 0x80000000);
+                break;
+            case 2: /* fsgnjx.s */
+                lane->fpr[rd] = a ^ (b & 0x80000000);
+                break;
+            default:
+                goto illegal;
+            }
+            break;
+        }
+        case FUNCT7_FMINMAX_S:
+            if (funct3 == 0) {
+                lane->fpr[rd] = float32_minnum(lane->fpr[rs1], lane->fpr[rs2],
+                                                &lane->fp_status);
+            } else if (funct3 == 1) {
+                lane->fpr[rd] = float32_maxnum(lane->fpr[rs1], lane->fpr[rs2],
+                                                &lane->fp_status);
+            } else {
+                goto illegal;
+            }
+            break;
+        case FUNCT7_FCMP_S: {
+            /* feq/flt/fle.s — 结果写 gpr[rd] */
+            bool result = false;
+            switch (funct3) {
+            case 2: /* feq.s */
+                result = float32_eq_quiet(lane->fpr[rs1], lane->fpr[rs2],
+                                          &lane->fp_status);
+                break;
+            case 1: /* flt.s */
+                result = float32_lt(lane->fpr[rs1], lane->fpr[rs2],
+                                    &lane->fp_status);
+                break;
+            case 0: /* fle.s */
+                result = float32_le(lane->fpr[rs1], lane->fpr[rs2],
+                                    &lane->fp_status);
+                break;
+            default:
+                goto illegal;
+            }
+            lane->gpr[rd] = result ? 1 : 0;
+            break;
+        }
+        case FUNCT7_FCVT_W_S:
+            /* rs2 field selects: 0=fcvt.w.s, 1=fcvt.wu.s */
+            if (rs2 == 0) {
+                lane->gpr[rd] = (uint32_t)float32_to_int32(
+                    lane->fpr[rs1], &lane->fp_status);
+            } else {
+                lane->gpr[rd] = float32_to_uint32(
+                    lane->fpr[rs1], &lane->fp_status);
+            }
+            break;
+        case FUNCT7_FCVT_S_W:
+            /* rs2 field selects: 0=fcvt.s.w, 1=fcvt.s.wu */
+            if (rs2 == 0) {
+                lane->fpr[rd] = int32_to_float32(
+                    (int32_t)lane->gpr[rs1], &lane->fp_status);
+            } else {
+                lane->fpr[rd] = uint32_to_float32(
+                    lane->gpr[rs1], &lane->fp_status);
+            }
+            break;
+        case FUNCT7_FMV_X_W:
+            if (funct3 == 0) {
+                /* fmv.x.w: gpr[rd] = fpr[rs1] (bitwise) */
+                lane->gpr[rd] = lane->fpr[rs1];
+            } else if (funct3 == 1) {
+                /* fclass.s */
+                lane->gpr[rd] = fclass_s(lane->fpr[rs1], &lane->fp_status);
+            } else {
+                goto illegal;
+            }
+            break;
+        case FUNCT7_FMV_W_X:
+            /* fmv.w.x: fpr[rd] = gpr[rs1] (bitwise) */
+            lane->fpr[rd] = lane->gpr[rs1];
+            break;
+        default:
+            goto illegal;
+        }
+        sync_fp_exceptions(lane);
+        break;
+    }
+
     case OPCODE_SYSTEM:
         /* ebreak: 停止执行 */
         if (inst == 0x00100073) {
@@ -416,10 +696,22 @@ static int exec_one_inst(GPGPUState *s, GPGPULane *lane, uint32_t inst)
         if (funct3 >= FUNCT3_CSRRW && funct3 <= FUNCT3_CSRRCI) {
             uint32_t csr = GET_CSR(inst);
             uint32_t csr_val = 0;
+            uint32_t write_val = 0;
+            bool do_write = false;
 
+            /* 读 CSR */
             switch (csr) {
             case CSR_MHARTID:
                 csr_val = lane->mhartid;
+                break;
+            case CSR_FFLAGS:
+                csr_val = lane->fcsr & 0x1F;
+                break;
+            case CSR_FRM:
+                csr_val = (lane->fcsr >> 5) & 0x7;
+                break;
+            case CSR_FCSR:
+                csr_val = lane->fcsr & 0xFF;
                 break;
             default:
                 qemu_log_mask(LOG_GUEST_ERROR,
@@ -427,15 +719,64 @@ static int exec_one_inst(GPGPUState *s, GPGPULane *lane, uint32_t inst)
                 break;
             }
 
-            /* 写入 rd（rd != x0 时） */
+            /* 计算新 CSR 值 */
+            switch (funct3) {
+            case FUNCT3_CSRRW:
+                write_val = src1;
+                do_write = true;
+                break;
+            case FUNCT3_CSRRS:
+                write_val = csr_val | src1;
+                do_write = (rs1 != 0);
+                break;
+            case FUNCT3_CSRRC:
+                write_val = csr_val & ~src1;
+                do_write = (rs1 != 0);
+                break;
+            case FUNCT3_CSRRWI:
+                write_val = rs1;  /* rs1 field is zimm */
+                do_write = true;
+                break;
+            case FUNCT3_CSRRSI:
+                write_val = csr_val | rs1;
+                do_write = (rs1 != 0);
+                break;
+            case FUNCT3_CSRRCI:
+                write_val = csr_val & ~rs1;
+                do_write = (rs1 != 0);
+                break;
+            }
+
+            /* 写入 rd */
             if (rd != 0) {
                 lane->gpr[rd] = csr_val;
             }
-            /* 只读 CSR，忽略写操作 */
+
+            /* 写 CSR */
+            if (do_write) {
+                switch (csr) {
+                case CSR_FFLAGS:
+                    lane->fcsr = (lane->fcsr & ~0x1F) | (write_val & 0x1F);
+                    break;
+                case CSR_FRM:
+                    lane->fcsr = (lane->fcsr & ~0xE0) |
+                                 ((write_val & 0x7) << 5);
+                    break;
+                case CSR_FCSR:
+                    lane->fcsr = write_val & 0xFF;
+                    break;
+                case CSR_MHARTID:
+                    /* mhartid is read-only */
+                    break;
+                default:
+                    break;
+                }
+            }
         }
         break;
 
     default:
+    illegal:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "GPGPU core: unknown opcode 0x%x (inst=0x%08x)\n",
                       opcode, inst);
@@ -483,6 +824,15 @@ void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
         }
         /* 寄存器初始化为 0 */
         memset(warp->lanes[i].gpr, 0, sizeof(warp->lanes[i].gpr));
+        memset(warp->lanes[i].fpr, 0, sizeof(warp->lanes[i].fpr));
+        warp->lanes[i].fcsr = 0;
+
+        /* 初始化 softfloat 状态 */
+        memset(&warp->lanes[i].fp_status, 0, sizeof(float_status));
+        set_default_nan_mode(true, &warp->lanes[i].fp_status);
+        set_float_default_nan_pattern(0x40, &warp->lanes[i].fp_status);
+        set_float_rounding_mode(float_round_nearest_even,
+                                &warp->lanes[i].fp_status);
     }
 }
 
