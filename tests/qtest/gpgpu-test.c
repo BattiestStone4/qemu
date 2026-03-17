@@ -761,6 +761,214 @@ static void gpgpu_test_lp_convert(void *obj, void *data,
     qpci_iounmap(pdev, bar2);
 }
 
+/*
+ * 测试 16: E5M2/E2M1 格式覆盖 + 负数测试
+ * 验证 E5M2 / E2M1 往返转换，以及 BF16/E4M3 负数转换
+ *
+ * output[0] = e5m2  round-trip(4)   → 4
+ * output[1] = e2m1  round-trip(2)   → 2
+ * output[2] = bf16  round-trip(-3)  → -3
+ * output[3] = e4m3  round-trip(-2)  → -2
+ */
+static const uint32_t lp_convert_e5m2_e2m1_kernel[] = {
+    0xF1402373,  /* csrrs  x6, mhartid, x0    ; x6 = mhartid           */
+    0x01F37313,  /* andi   x6, x6, 0x1F       ; x6 = tid               */
+
+    /* E5M2 round-trip: 4 → f32 → e5m2 → f32 → int */
+    0x00400493,  /* addi   x9, x0, 4          ; x9 = 4                  */
+    0xD00480D3,  /* fcvt.s.w  f1, x9           ; f1 = 4.0              */
+    0x48308153,  /* fcvt.e5m2.s f2, f1         ; f2 = e5m2(4.0)        */
+    0x482101D3,  /* fcvt.s.e5m2 f3, f2         ; f3 = f32(e5m2)        */
+    0xC0019553,  /* fcvt.w.s x10, f3, rtz      ; x10 = 4               */
+
+    /* E2M1 round-trip: 2 → f32 → e2m1 → f32 → int */
+    0x00200493,  /* addi   x9, x0, 2          ; x9 = 2                  */
+    0xD00480D3,  /* fcvt.s.w  f1, x9           ; f1 = 2.0              */
+    0x4C108153,  /* fcvt.e2m1.s f2, f1         ; f2 = e2m1(2.0)        */
+    0x4C0101D3,  /* fcvt.s.e2m1 f3, f2         ; f3 = f32(e2m1)        */
+    0xC00195D3,  /* fcvt.w.s x11, f3, rtz      ; x11 = 2               */
+
+    /* BF16 round-trip: -3 → f32 → bf16 → f32 → int */
+    0xFFD00493,  /* addi   x9, x0, -3         ; x9 = -3                 */
+    0xD00480D3,  /* fcvt.s.w  f1, x9           ; f1 = -3.0             */
+    0x44108153,  /* fcvt.bf16.s f2, f1         ; f2 = bf16(-3.0)        */
+    0x440101D3,  /* fcvt.s.bf16 f3, f2         ; f3 = f32(bf16)         */
+    0xC0019653,  /* fcvt.w.s x12, f3, rtz      ; x12 = -3              */
+
+    /* E4M3 round-trip: -2 → f32 → e4m3 → f32 → int */
+    0xFFE00493,  /* addi   x9, x0, -2         ; x9 = -2                 */
+    0xD00480D3,  /* fcvt.s.w  f1, x9           ; f1 = -2.0             */
+    0x48108153,  /* fcvt.e4m3.s f2, f1         ; f2 = e4m3(-2.0)       */
+    0x480101D3,  /* fcvt.s.e4m3 f3, f2         ; f3 = f32(e4m3)        */
+    0xC00196D3,  /* fcvt.w.s x13, f3, rtz      ; x13 = -2              */
+
+    /* Store 4 results: tid * 16 offset */
+    0x00431413,  /* slli   x8, x6, 4          ; x8 = tid * 16           */
+    0x00001E37,  /* lui    x28, 1             ; x28 = 0x1000             */
+    0x008E0E33,  /* add    x28, x28, x8       ; x28 = base + offset     */
+    0x00AE2023,  /* sw     x10, 0(x28)        ; output[0] = 4           */
+    0x00BE2223,  /* sw     x11, 4(x28)        ; output[1] = 2           */
+    0x00CE2423,  /* sw     x12, 8(x28)        ; output[2] = -3          */
+    0x00DE2623,  /* sw     x13, 12(x28)       ; output[3] = -2          */
+    0x00100073,  /* ebreak                    ; stop                     */
+};
+
+static void gpgpu_test_lp_convert_e5m2_e2m1(void *obj, void *data,
+                                              QGuestAllocator *alloc)
+{
+    QGPGPU *gpgpu = obj;
+    QPCIDevice *pdev = &gpgpu->dev;
+    QPCIBar bar0, bar2;
+    uint32_t val;
+    uint32_t num_threads = 1;
+    int32_t expected[] = { 4, 2, -3, -2 };
+
+    qpci_device_enable(pdev);
+    bar0 = qpci_iomap(pdev, 0, NULL);
+    bar2 = qpci_iomap(pdev, 2, NULL);
+
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
+
+    for (size_t i = 0; i < sizeof(lp_convert_e5m2_e2m1_kernel) /
+                            sizeof(lp_convert_e5m2_e2m1_kernel[0]); i++) {
+        qpci_io_writel(pdev, bar2, i * 4, lp_convert_e5m2_e2m1_kernel[i]);
+    }
+
+    for (uint32_t i = 0; i < 4; i++) {
+        qpci_io_writel(pdev, bar2, 0x1000 + i * 4, 0xDEADBEEF);
+    }
+
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ADDR_LO, 0x0000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ADDR_HI, 0x0000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_X, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Y, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Z, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_X, num_threads);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Y, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Z, 1);
+
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DISPATCH, 1);
+
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_GLOBAL_STATUS);
+    g_assert_cmpuint(val & GPGPU_STATUS_READY, ==, GPGPU_STATUS_READY);
+
+    for (int i = 0; i < 4; i++) {
+        val = qpci_io_readl(pdev, bar2, 0x1000 + i * 4);
+        g_assert_cmpint((int32_t)val, ==, expected[i]);
+    }
+
+    qpci_iounmap(pdev, bar0);
+    qpci_iounmap(pdev, bar2);
+}
+
+/*
+ * 测试 17: 零值、溢出饱和、Inf 饱和测试
+ * 验证零值正确转换、超出格式范围的值被饱和到最大值、Inf 也被饱和
+ *
+ * output[0] = e4m3 round-trip(0)    → 0
+ * output[1] = e2m1 round-trip(0)    → 0
+ * output[2] = e2m1 round-trip(100)  → 6   (E2M1 max, saturated)
+ * output[3] = e4m3 round-trip(1000) → 448 (E4M3 max, saturated)
+ * output[4] = e4m3(+Inf)           → 448 (Inf → E4M3 max, saturated)
+ */
+static const uint32_t lp_convert_saturate_kernel[] = {
+    0xF1402373,  /* csrrs  x6, mhartid, x0    ; x6 = mhartid           */
+    0x01F37313,  /* andi   x6, x6, 0x1F       ; x6 = tid               */
+
+    /* E4M3 round-trip: 0 → f32 → e4m3 → f32 → int */
+    0x00000493,  /* addi   x9, x0, 0          ; x9 = 0                  */
+    0xD00480D3,  /* fcvt.s.w  f1, x9           ; f1 = 0.0              */
+    0x48108153,  /* fcvt.e4m3.s f2, f1         ; f2 = e4m3(0.0)        */
+    0x480101D3,  /* fcvt.s.e4m3 f3, f2         ; f3 = f32(e4m3)        */
+    0xC0019553,  /* fcvt.w.s x10, f3, rtz      ; x10 = 0               */
+
+    /* E2M1 round-trip: 0 → f32 → e2m1 → f32 → int */
+    0x00000493,  /* addi   x9, x0, 0          ; x9 = 0                  */
+    0xD00480D3,  /* fcvt.s.w  f1, x9           ; f1 = 0.0              */
+    0x4C108153,  /* fcvt.e2m1.s f2, f1         ; f2 = e2m1(0.0)        */
+    0x4C0101D3,  /* fcvt.s.e2m1 f3, f2         ; f3 = f32(e2m1)        */
+    0xC00195D3,  /* fcvt.w.s x11, f3, rtz      ; x11 = 0               */
+
+    /* E2M1 round-trip: 100 → saturate → 6 */
+    0x06400493,  /* addi   x9, x0, 100        ; x9 = 100                */
+    0xD00480D3,  /* fcvt.s.w  f1, x9           ; f1 = 100.0            */
+    0x4C108153,  /* fcvt.e2m1.s f2, f1         ; f2 = e2m1(100.0) sat  */
+    0x4C0101D3,  /* fcvt.s.e2m1 f3, f2         ; f3 = 6.0              */
+    0xC0019653,  /* fcvt.w.s x12, f3, rtz      ; x12 = 6               */
+
+    /* E4M3 round-trip: 1000 → saturate → 448 */
+    0x3E800493,  /* addi   x9, x0, 1000       ; x9 = 1000              */
+    0xD00480D3,  /* fcvt.s.w  f1, x9           ; f1 = 1000.0           */
+    0x48108153,  /* fcvt.e4m3.s f2, f1         ; f2 = e4m3(1000) sat   */
+    0x480101D3,  /* fcvt.s.e4m3 f3, f2         ; f3 = 448.0            */
+    0xC00196D3,  /* fcvt.w.s x13, f3, rtz      ; x13 = 448             */
+
+    /* E4M3 of +Inf → saturate → 448 */
+    0x7F8004B7,  /* lui    x9, 0x7F800        ; x9 = 0x7F800000 (+Inf) */
+    0xF00480D3,  /* fmv.w.x f1, x9            ; f1 = +Inf              */
+    0x48108153,  /* fcvt.e4m3.s f2, f1         ; f2 = e4m3(Inf) sat    */
+    0x480101D3,  /* fcvt.s.e4m3 f3, f2         ; f3 = 448.0            */
+    0xC0019753,  /* fcvt.w.s x14, f3, rtz      ; x14 = 448             */
+
+    /* Store 5 results: tid * 20 offset (tid=0 → base=0x1000) */
+    0x00001E37,  /* lui    x28, 1             ; x28 = 0x1000             */
+    0x00AE2023,  /* sw     x10, 0(x28)        ; output[0] = 0           */
+    0x00BE2223,  /* sw     x11, 4(x28)        ; output[1] = 0           */
+    0x00CE2423,  /* sw     x12, 8(x28)        ; output[2] = 6           */
+    0x00DE2623,  /* sw     x13, 12(x28)       ; output[3] = 448         */
+    0x00EE2823,  /* sw     x14, 16(x28)       ; output[4] = 448         */
+    0x00100073,  /* ebreak                    ; stop                     */
+};
+
+static void gpgpu_test_lp_convert_saturate(void *obj, void *data,
+                                            QGuestAllocator *alloc)
+{
+    QGPGPU *gpgpu = obj;
+    QPCIDevice *pdev = &gpgpu->dev;
+    QPCIBar bar0, bar2;
+    uint32_t val;
+    uint32_t num_threads = 1;
+    int32_t expected[] = { 0, 0, 6, 448, 448 };
+    int num_results = 5;
+
+    qpci_device_enable(pdev);
+    bar0 = qpci_iomap(pdev, 0, NULL);
+    bar2 = qpci_iomap(pdev, 2, NULL);
+
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
+
+    for (size_t i = 0; i < sizeof(lp_convert_saturate_kernel) /
+                            sizeof(lp_convert_saturate_kernel[0]); i++) {
+        qpci_io_writel(pdev, bar2, i * 4, lp_convert_saturate_kernel[i]);
+    }
+
+    for (int i = 0; i < num_results; i++) {
+        qpci_io_writel(pdev, bar2, 0x1000 + i * 4, 0xDEADBEEF);
+    }
+
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ADDR_LO, 0x0000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ADDR_HI, 0x0000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_X, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Y, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Z, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_X, num_threads);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Y, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Z, 1);
+
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DISPATCH, 1);
+
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_GLOBAL_STATUS);
+    g_assert_cmpuint(val & GPGPU_STATUS_READY, ==, GPGPU_STATUS_READY);
+
+    for (int i = 0; i < num_results; i++) {
+        val = qpci_io_readl(pdev, bar2, 0x1000 + i * 4);
+        g_assert_cmpint((int32_t)val, ==, expected[i]);
+    }
+
+    qpci_iounmap(pdev, bar0);
+    qpci_iounmap(pdev, bar2);
+}
+
 static void gpgpu_register_nodes(void)
 {
     QOSGraphEdgeOptions opts = {
@@ -798,6 +1006,10 @@ static void gpgpu_register_nodes(void)
     qos_add_test("kernel-exec", "gpgpu", gpgpu_test_kernel_exec, NULL);
     qos_add_test("fp-kernel-exec", "gpgpu", gpgpu_test_fp_kernel_exec, NULL);
     qos_add_test("lp-convert", "gpgpu", gpgpu_test_lp_convert, NULL);
+    qos_add_test("lp-convert-e5m2-e2m1", "gpgpu",
+                 gpgpu_test_lp_convert_e5m2_e2m1, NULL);
+    qos_add_test("lp-convert-saturate", "gpgpu",
+                 gpgpu_test_lp_convert_saturate, NULL);
 }
 
 libqos_init(gpgpu_register_nodes);
