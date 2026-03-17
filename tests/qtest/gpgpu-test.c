@@ -665,6 +665,102 @@ static void gpgpu_test_fp_kernel_exec(void *obj, void *data,
     qpci_iounmap(pdev, bar2);
 }
 
+/*
+ * 测试 15: 低精度浮点转换指令测试
+ * 验证 BF16 和 FP8-E4M3 往返转换精度
+ *
+ * Kernel: 对每个线程:
+ *   BF16 round-trip:  42 → f32 → bf16 → f32 → int  (期望 42)
+ *   E4M3 round-trip:   2 → f32 → e4m3 → f32 → int  (期望 2)
+ *   output[tid*2]   = bf16 结果
+ *   output[tid*2+1] = e4m3 结果
+ */
+static const uint32_t lp_convert_kernel[] = {
+    0xF1402373,  /* csrrs  x6, mhartid, x0    ; x6 = mhartid           */
+    0x01F37313,  /* andi   x6, x6, 0x1F       ; x6 = tid               */
+
+    /* BF16 round-trip: 42 → f32 → bf16 → f32 → int */
+    0x02A00493,  /* addi   x9, x0, 42         ; x9 = 42                */
+    0xD00480D3,  /* fcvt.s.w  f1, x9           ; f1 = 42.0             */
+    0x44108153,  /* fcvt.bf16.s f2, f1         ; f2[15:0] = bf16(42.0) */
+    0x440101D3,  /* fcvt.s.bf16 f3, f2         ; f3 = f32(bf16)        */
+    0xC0019553,  /* fcvt.w.s x10, f3, rtz      ; x10 = (int)f3 = 42   */
+
+    /* E4M3 round-trip: 2 → f32 → e4m3 → f32 → int */
+    0x00200493,  /* addi   x9, x0, 2          ; x9 = 2                 */
+    0xD00480D3,  /* fcvt.s.w  f1, x9           ; f1 = 2.0              */
+    0x48108153,  /* fcvt.e4m3.s f2, f1         ; f2[7:0] = e4m3(2.0)  */
+    0x480101D3,  /* fcvt.s.e4m3 f3, f2         ; f3 = f32(e4m3(2.0))  */
+    0xC00195D3,  /* fcvt.w.s x11, f3, rtz      ; x11 = (int)f3 = 2    */
+
+    /* Store: output[tid*2]=x10, output[tid*2+1]=x11 */
+    0x00331413,  /* slli   x8, x6, 3          ; x8 = tid * 8           */
+    0x00001E37,  /* lui    x28, 1             ; x28 = 0x1000            */
+    0x008E0E33,  /* add    x28, x28, x8       ; x28 = &output[tid*2]   */
+    0x00AE2023,  /* sw     x10, 0(x28)        ; output[tid*2] = 42     */
+    0x00BE2223,  /* sw     x11, 4(x28)        ; output[tid*2+1] = 2    */
+    0x00100073,  /* ebreak                    ; stop                    */
+};
+
+static void gpgpu_test_lp_convert(void *obj, void *data,
+                                   QGuestAllocator *alloc)
+{
+    QGPGPU *gpgpu = obj;
+    QPCIDevice *pdev = &gpgpu->dev;
+    QPCIBar bar0, bar2;
+    uint32_t val;
+    uint32_t num_threads = 4;
+
+    qpci_device_enable(pdev);
+    bar0 = qpci_iomap(pdev, 0, NULL);
+    bar2 = qpci_iomap(pdev, 2, NULL);
+
+    /* 1. 使能设备 */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GLOBAL_CTRL, GPGPU_CTRL_ENABLE);
+
+    /* 2. 上传内核代码到 VRAM */
+    for (size_t i = 0; i < sizeof(lp_convert_kernel) /
+                            sizeof(lp_convert_kernel[0]); i++) {
+        qpci_io_writel(pdev, bar2, i * 4, lp_convert_kernel[i]);
+    }
+
+    /* 3. 清零输出区域 (tid*2 个 uint32, 即 num_threads*2) */
+    for (uint32_t i = 0; i < num_threads * 2; i++) {
+        qpci_io_writel(pdev, bar2, 0x1000 + i * 4, 0xDEADBEEF);
+    }
+
+    /* 4. 配置内核参数 */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ADDR_LO, 0x0000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_KERNEL_ADDR_HI, 0x0000);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_X, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Y, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_GRID_DIM_Z, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_X, num_threads);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Y, 1);
+    qpci_io_writel(pdev, bar0, GPGPU_REG_BLOCK_DIM_Z, 1);
+
+    /* 5. 触发内核执行 */
+    qpci_io_writel(pdev, bar0, GPGPU_REG_DISPATCH, 1);
+
+    /* 6. 检查执行完成 */
+    val = qpci_io_readl(pdev, bar0, GPGPU_REG_GLOBAL_STATUS);
+    g_assert_cmpuint(val & GPGPU_STATUS_READY, ==, GPGPU_STATUS_READY);
+
+    /* 7. 验证输出结果 */
+    for (uint32_t i = 0; i < num_threads; i++) {
+        /* BF16 round-trip: 42 → bf16 → f32 → 42 */
+        val = qpci_io_readl(pdev, bar2, 0x1000 + i * 8);
+        g_assert_cmpuint(val, ==, 42);
+
+        /* E4M3 round-trip: 2 → e4m3 → f32 → 2 */
+        val = qpci_io_readl(pdev, bar2, 0x1000 + i * 8 + 4);
+        g_assert_cmpuint(val, ==, 2);
+    }
+
+    qpci_iounmap(pdev, bar0);
+    qpci_iounmap(pdev, bar2);
+}
+
 static void gpgpu_register_nodes(void)
 {
     QOSGraphEdgeOptions opts = {
@@ -701,6 +797,7 @@ static void gpgpu_register_nodes(void)
     /* 内核执行测试 */
     qos_add_test("kernel-exec", "gpgpu", gpgpu_test_kernel_exec, NULL);
     qos_add_test("fp-kernel-exec", "gpgpu", gpgpu_test_fp_kernel_exec, NULL);
+    qos_add_test("lp-convert", "gpgpu", gpgpu_test_lp_convert, NULL);
 }
 
 libqos_init(gpgpu_register_nodes);

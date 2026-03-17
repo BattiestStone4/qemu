@@ -86,6 +86,11 @@
 #define FUNCT7_FCMP_S     0x50
 #define FUNCT7_FMV_W_X    0x78
 
+/* Low-precision float conversion funct7 (custom extension) */
+#define FUNCT7_FCVT_BF16  0x22
+#define FUNCT7_FCVT_FP8   0x24
+#define FUNCT7_FCVT_FP4   0x26
+
 /* funct3 for SYSTEM (CSR instructions) */
 #define FUNCT3_CSRRW    0x1
 #define FUNCT3_CSRRS    0x2
@@ -310,6 +315,50 @@ static uint32_t fclass_s(float32 val, float_status *fps)
     if (is_snan)             return 1 << 8;   /* signaling NaN */
     if (is_qnan)             return 1 << 9;   /* quiet NaN */
     return 1 << 9; /* fallback: qNaN */
+}
+
+/**
+ * float32_to_float4_e2m1 - FP32 → E2M1 (4-bit float) conversion
+ *
+ * E2M1 format: sign(1) + exp(2, bias=1) + man(1) = 4 bits
+ * Representable magnitudes: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
+ * Values beyond 6.0 are saturated.  No Inf/NaN representation.
+ */
+static float4_e2m1 float32_to_float4_e2m1(float32 a, float_status *status)
+{
+    uint32_t sign = (a >> 31) & 1;
+    uint32_t abs_a = a & 0x7FFFFFFF;
+
+    /* NaN / Inf → saturate to ±6.0 */
+    if (abs_a >= 0x7F800000) {
+        return (sign << 3) | 0x7;
+    }
+    /* ±0 */
+    if (abs_a == 0) {
+        return sign << 3;
+    }
+
+    /*
+     * Round to nearest E2M1 value using midpoints:
+     *   0 ↔ 0.5  : 0.25   (0x3E800000)
+     *   0.5 ↔ 1.0: 0.75   (0x3F400000)
+     *   1.0 ↔ 1.5: 1.25   (0x3FA00000)
+     *   1.5 ↔ 2.0: 1.75   (0x3FE00000)
+     *   2.0 ↔ 3.0: 2.5    (0x40200000)
+     *   3.0 ↔ 4.0: 3.5    (0x40600000)
+     *   4.0 ↔ 6.0: 5.0    (0x40A00000)
+     */
+    uint8_t mag;
+    if      (abs_a < 0x3E800000) mag = 0; /* 0   */
+    else if (abs_a < 0x3F400000) mag = 1; /* 0.5 */
+    else if (abs_a < 0x3FA00000) mag = 2; /* 1.0 */
+    else if (abs_a < 0x3FE00000) mag = 3; /* 1.5 */
+    else if (abs_a < 0x40200000) mag = 4; /* 2.0 */
+    else if (abs_a < 0x40600000) mag = 5; /* 3.0 */
+    else if (abs_a < 0x40A00000) mag = 6; /* 4.0 */
+    else                         mag = 7; /* 6.0 */
+
+    return (sign << 3) | mag;
 }
 
 /*
@@ -680,6 +729,82 @@ static int exec_one_inst(GPGPUState *s, GPGPULane *lane, uint32_t inst)
             /* fmv.w.x: fpr[rd] = gpr[rs1] (bitwise) */
             lane->fpr[rd] = lane->gpr[rs1];
             break;
+
+        /* ============================================================
+         * Low-precision float conversions (BF16 / FP8 / FP4)
+         * ============================================================ */
+        case FUNCT7_FCVT_BF16:
+            if (rs2 == 0) {
+                /* FCVT.S.BF16: frd = bf16→f32(frs1[15:0]) */
+                bfloat16 bf = (bfloat16)(lane->fpr[rs1] & 0xFFFF);
+                lane->fpr[rd] = bfloat16_to_float32(bf, &lane->fp_status);
+            } else if (rs2 == 1) {
+                /* FCVT.BF16.S: frd[15:0] = f32→bf16(frs1) */
+                bfloat16 bf = float32_to_bfloat16(lane->fpr[rs1],
+                                                   &lane->fp_status);
+                lane->fpr[rd] = (uint32_t)bf;
+            } else {
+                goto illegal;
+            }
+            break;
+
+        case FUNCT7_FCVT_FP8:
+            switch (rs2) {
+            case 0: {
+                /* FCVT.S.E4M3: frd = e4m3→f32(frs1[7:0]) */
+                float8_e4m3 e4 = (float8_e4m3)(lane->fpr[rs1] & 0xFF);
+                bfloat16 bf = float8_e4m3_to_bfloat16(e4, &lane->fp_status);
+                lane->fpr[rd] = bfloat16_to_float32(bf, &lane->fp_status);
+                break;
+            }
+            case 1: {
+                /* FCVT.E4M3.S: frd[7:0] = f32→e4m3(frs1) */
+                float8_e4m3 e4 = float32_to_float8_e4m3(lane->fpr[rs1],
+                                                         true,
+                                                         &lane->fp_status);
+                lane->fpr[rd] = (uint32_t)e4;
+                break;
+            }
+            case 2: {
+                /* FCVT.S.E5M2: frd = e5m2→f32(frs1[7:0]) */
+                float8_e5m2 e5 = (float8_e5m2)(lane->fpr[rs1] & 0xFF);
+                bfloat16 bf = float8_e5m2_to_bfloat16(e5, &lane->fp_status);
+                lane->fpr[rd] = bfloat16_to_float32(bf, &lane->fp_status);
+                break;
+            }
+            case 3: {
+                /* FCVT.E5M2.S: frd[7:0] = f32→e5m2(frs1) */
+                float8_e5m2 e5 = float32_to_float8_e5m2(lane->fpr[rs1],
+                                                         true,
+                                                         &lane->fp_status);
+                lane->fpr[rd] = (uint32_t)e5;
+                break;
+            }
+            default:
+                goto illegal;
+            }
+            break;
+
+        case FUNCT7_FCVT_FP4:
+            if (rs2 == 0) {
+                /* FCVT.S.E2M1: frd = e2m1→f32(frs1[3:0])
+                 * chain: e2m1 → e4m3 → bf16 → f32 */
+                float4_e2m1 e2 = (float4_e2m1)(lane->fpr[rs1] & 0xF);
+                float8_e4m3 e4 = float4_e2m1_to_float8_e4m3(e2,
+                                                              &lane->fp_status);
+                bfloat16 bf = float8_e4m3_to_bfloat16(e4, &lane->fp_status);
+                lane->fpr[rd] = bfloat16_to_float32(bf, &lane->fp_status);
+            } else if (rs2 == 1) {
+                /* FCVT.E2M1.S: frd[3:0] = f32→e2m1(frs1)
+                 * manual rounding to 4-bit E2M1 */
+                float4_e2m1 e2 = float32_to_float4_e2m1(lane->fpr[rs1],
+                                                          &lane->fp_status);
+                lane->fpr[rd] = (uint32_t)(e2 & 0xF);
+            } else {
+                goto illegal;
+            }
+            break;
+
         default:
             goto illegal;
         }
